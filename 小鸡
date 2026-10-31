@@ -1,0 +1,1605 @@
+import base64
+import zlib
+import hashlib
+import html
+import json
+import os
+import re
+import tempfile
+import threading
+import time
+import uuid
+from collections import OrderedDict
+from http.cookiejar import CookieJar
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPCookieProcessor, Request, build_opener
+
+try:
+    from base.spider import Spider as _BaseSpider
+except ImportError:
+    class _BaseSpider(object):
+        pass
+
+
+_API = 'https://50.118.186.185:8090'
+_APP = 'com.xmoebr.bdx'
+_VERSION = '105'
+_FINGERPRINT = '20325CC2D4A95E4088BB202A4F66B4E792060ED84F5E3F0E8B41D2DE0AE3A279'
+_CLIENT_MATERIAL = 'SK-sk_13oXDZ7u9j2Tk1c0cawWVFfO'
+_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+_MOBILE_UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
+_MEDIA_RE = re.compile(r'\.(m3u8?|mp4|m4v|mkv|mov|flv|webm|mpd|ts)(?:[?#]|$)', re.I)
+_FILTERS = {
+    '电影': ('动作,喜剧,爱情,科幻,恐怖,悬疑,犯罪,战争,动画,冒险,历史,灾难,纪录,剧情', '大陆,香港,台湾,美国,日本,韩国,泰国,印度,英国,法国,德国,加拿大,西班牙,意大利,澳大利亚', 2016, ['2015-2011', '2010-2000', '90年代', '80年代', '更早']),
+    '剧集': ('爱情,古装,武侠,历史,家庭,喜剧,悬疑,犯罪,战争,奇幻,科幻,恐怖', '大陆,香港,台湾,美国,日本,韩国,泰国,英国', 2021, ['2020-2016', '2015-2011', '2010-2000', '更早']),
+    '综艺': ('真人秀,音乐,脱口秀,歌舞,爱情', '大陆,香港,台湾,美国,日本,韩国', 2011, ['更早']),
+    '动漫': ('冒险,奇幻,科幻,武侠,悬疑', '大陆,日本,欧美', 2011, ['更早']),
+}
+
+
+def _text(value):
+    if value is None:
+        return ''
+    if isinstance(value, (list, tuple)):
+        return ','.join(_text(x) for x in value if x is not None)
+    if isinstance(value, dict):
+        return ''
+    return str(value)
+
+
+def _int(value, default=1):
+    try:
+        number = int(value)
+        return number if number > 0 else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _pack(kind, value):
+    raw = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    return kind + base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def _unpack(kind, value):
+    if not isinstance(value, str) or not value.startswith(kind) or len(value) > 131072:
+        raise ValueError('Invalid playback identifier')
+    raw = value[len(kind):]
+    result = json.loads(base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4)).decode('utf-8'))
+    if not isinstance(result, dict):
+        raise ValueError('Invalid playback identifier')
+    return result
+
+
+def _http_url(value):
+    try:
+        p = urlsplit(value)
+        return p.scheme in ('http', 'https') and bool(p.hostname) and not p.username and not p.password
+    except (ValueError, TypeError):
+        return False
+
+
+class _ApiError(Exception):
+    def __init__(self, message, code=0, status=0):
+        self.code = code
+        self.status = status
+        self.message = re.sub(r'https?://\S+', '[URL]', _text(message))[:200] or '请求失败'
+        super().__init__(self.message)
+
+
+class _CoreSpider(_BaseSpider):
+    def getName(self):
+        return '小鸡看看'
+
+    def getDependence(self):
+        return []
+
+    def init(self, extend=''):
+        if isinstance(extend, str):
+            try:
+                extend = json.loads(extend) if extend.strip().startswith('{') else {}
+            except ValueError:
+                extend = {}
+        config = extend if isinstance(extend, dict) else {}
+        api = _text(config.get('api') or _API).rstrip('/')
+        self._api = api if _http_url(api) else _API
+        self._search_mode = 'outer' if config.get('search_mode') == 'outer' else 'inner'
+        self._include_external = config.get('external', True) is not False
+        self._lock = threading.RLock()
+        self._cache = OrderedDict()
+        self._home_data = None
+        self._categories = {}
+        self._device = self._device_id()
+        self._opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        self._clock_offset = 0
+        self._last_error = ''
+        return {}
+
+    def _ready(self):
+        if not hasattr(self, '_opener'):
+            self.init()
+
+    def _device_id(self):
+        cache_key = 'xiaojikankan_device_v1'
+        getter = getattr(self, 'getCache', None)
+        setter = getattr(self, 'setCache', None)
+        if callable(getter):
+            try:
+                value = getter(cache_key)
+                if isinstance(value, str) and re.fullmatch(r'uuid-[0-9a-f-]{36}', value):
+                    return value
+            except Exception:
+                pass
+        filename = os.path.join(tempfile.gettempdir(), '.xiaojikankan-device-v1')
+        value = ''
+        try:
+            with open(filename, 'r', encoding='ascii') as stream:
+                value = stream.read(80).strip()
+        except (OSError, UnicodeError):
+            pass
+        if not re.fullmatch(r'uuid-[0-9a-f-]{36}', value):
+            value = 'uuid-' + str(uuid.uuid4())
+            try:
+                fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, 'w', encoding='ascii') as stream:
+                    stream.write(value)
+            except OSError:
+                try:
+                    with open(filename, 'r', encoding='ascii') as stream:
+                        existing = stream.read(80).strip()
+                    if re.fullmatch(r'uuid-[0-9a-f-]{36}', existing):
+                        value = existing
+                    else:
+                        with open(filename, 'w', encoding='ascii') as stream:
+                            stream.write(value)
+                except (OSError, UnicodeError):
+                    value = getattr(self, '_device', value)
+        if callable(setter):
+            try:
+                setter(cache_key, value)
+            except Exception:
+                pass
+        return value
+
+    def _headers(self):
+        timestamp = str(int(time.time()*1000 + self._clock_offset))
+        prefix = hashlib.sha256(self._device.encode('utf-8')).hexdigest()[:8].upper()
+        nonce = prefix + ''.join(str(n % 10) for n in os.urandom(8))
+        payload = 'finger=SF-%s&id=%s&nonce=%s&sk=%s&time=%s&v=%s' % (_FINGERPRINT, _APP, nonce, _CLIENT_MATERIAL, timestamp, _VERSION)
+        signature = hashlib.sha256(payload.encode('utf-8')).hexdigest().upper()
+        return {'Accept': 'application/json', 'Accept-Encoding': 'gzip', 'User-Agent': 'okhttp/4.12.0', 'x-aid': _APP, 'x-ave': _VERSION, 'x-time': timestamp, 'x-nonc': nonce, 'x-sign': signature, 'x-device-id': self._device, 'x-device-brand': 'unknown', 'x-device-model': 'unknown', 'x-update-id': 'embedded'}
+
+    def _get_cached(self, key):
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry and entry[0] > time.monotonic():
+                self._cache.move_to_end(key)
+                return entry[1]
+            self._cache.pop(key, None)
+        return None
+
+    def _put_cached(self, key, value, ttl):
+        if ttl <= 0:
+            return value
+        with self._lock:
+            self._cache[key] = (time.monotonic() + ttl, value)
+            self._cache.move_to_end(key)
+            while len(self._cache) > 96:
+                self._cache.popitem(last=False)
+        return value
+
+    def _request(self, path, params=None, ttl=0, timeout=15, success=200):
+        self._ready()
+        params = {k: _text(v) for k, v in (params or {}).items() if v is not None and _text(v) != ''}
+        key = ('api', path, tuple(sorted(params.items())))
+        cached = self._get_cached(key) if ttl else None
+        if cached is not None:
+            return cached
+        url = self._api + '/api.php/app/' + path.lstrip('/')
+        if params:
+            url += '?' + urlencode(params)
+        request = Request(url, headers=self._headers())
+        try:
+            try:
+                response = self._opener.open(request, timeout=timeout)
+            except HTTPError as exc:
+                response = exc
+            with response:
+                status = response.code
+                raw = response.read(8388609)
+                if len(raw) > 8388608:
+                    raise _ApiError('接口响应过大', status=status)
+                if response.headers.get('Content-Encoding', '').lower() == 'gzip':
+                    inflater = zlib.decompressobj(31)
+                    raw = inflater.decompress(raw, 16777217)
+                    if inflater.unconsumed_tail or not inflater.eof:
+                        raise _ApiError('接口压缩响应错误或过大', status=status)
+                if len(raw) > 16777216:
+                    raise _ApiError('接口响应过大', status=status)
+                try:
+                    result = json.loads(raw.decode('utf-8-sig'))
+                except (ValueError, UnicodeError):
+                    raise _ApiError('接口未返回有效 JSON', status=status)
+            if not isinstance(result, dict):
+                raise _ApiError('接口数据结构错误', status=status)
+            code = result.get('code')
+            if status != 200 or code != success:
+                raise _ApiError(result.get('msg'), code=code, status=status)
+            return self._put_cached(key, result.get('data'), ttl)
+        except _ApiError:
+            raise
+        except Exception as exc:
+            raise _ApiError('网络请求失败 (%s)' % type(exc).__name__)
+
+    def _failure(self, exc):
+        self._last_error = exc.message if isinstance(exc, _ApiError) else '数据处理失败 (%s)' % type(exc).__name__
+        return self._last_error
+
+    def _item(self, data, external=False):
+        if not isinstance(data, dict):
+            return None
+        name = _text(data.get('vod_name')).strip()
+        identity = _text(data.get('vod_id')).strip()
+        if not name:
+            return None
+        if external:
+            identity = _pack('xjkx:', {k: data[k] for k in ('vod_name', 'vod_year', 'vod_pic', 'vod_douban_pic', 'vod_remarks', 'standard_category', 'vod_class', 'vod_douban_id', 'vod_content', 'vod_actor', 'vod_area') if k in data})
+        elif not identity or identity == '0':
+            return None
+        item = {k: _text(data.get(k)) for k in ('vod_name', 'vod_remarks', 'vod_year', 'vod_area', 'type_name', 'vod_actor')}
+        item['vod_id'] = identity
+        item['vod_pic'] = _text(data.get('vod_pic') or data.get('vod_douban_pic'))
+        return item
+
+    def _home(self):
+        data = self._request('index/home', ttl=120)
+        if not isinstance(data, dict):
+            raise _ApiError('首页数据结构错误')
+        self._home_data = data
+        self._categories = {_text(c.get('type_id')): c for c in data.get('categories', []) if isinstance(c, dict) and c.get('type_name') and c.get('type_id') is not None}
+        return data
+
+    def _filter_options(self, name):
+        result = []
+        spec = _FILTERS.get(name)
+        if spec:
+            genres, areas, first_year, older = spec
+            years = [str(y) for y in range(time.localtime().tm_year, first_year-1, -1)] + older
+            for key, label, values in [('class', '类型', genres.split(',')), ('area', '地区', areas.split(',')), ('year', '年份', years)]:
+                result.append({'key': key, 'name': label, 'init': '', 'value': [{'n': '全部', 'v': ''}] + [{'n': v, 'v': v} for v in values]})
+        result.append({'key': 'sort', 'name': '排序', 'init': 'hits', 'value': [{'n': name, 'v': key} for key, name in [('hits', '人气'), ('time', '最新'), ('score', '评分'), ('year', '年份')]]})
+        return result
+
+    def _home_items(self, data):
+        rows = list(data.get('recommend') or [])
+        for category in data.get('categories') or []:
+            if isinstance(category, dict):
+                rows.extend(category.get('videos') or [])
+        rows.extend(data.get('hotSearch') or [])
+        items, seen = [], set()
+        for row in rows:
+            item = self._item(row)
+            if item and item['vod_id'] not in seen:
+                items.append(item)
+                seen.add(item['vod_id'])
+        return items
+
+    def homeContent(self, filter=False):
+        self._ready()
+        try:
+            data = self._home()
+            classes = [{'type_id': key, 'type_name': _text(c['type_name'])} for key, c in self._categories.items()]
+            filters = {key: self._filter_options(_text(c['type_name'])) for key, c in self._categories.items()} if filter else {}
+            return {'class': classes, 'filters': filters, 'list': self._home_items(data)}
+        except Exception as exc:
+            return {'class': [], 'filters': {}, 'list': [], 'msg': self._failure(exc)}
+
+    def homeVideoContent(self):
+        try:
+            return {'list': self._home_items(self._home())}
+        except Exception as exc:
+            return {'list': [], 'msg': self._failure(exc)}
+
+    def _page(self, rows, page, size, threshold):
+        rows = rows if isinstance(rows, list) else []
+        items = [item for item in (self._item(row) for row in rows) if item]
+        more = len(rows) >= threshold
+        return {'list': items, 'page': page, 'pagecount': page + int(more), 'limit': size, 'total': (page-1)*size + len(rows) + int(more)}
+
+    def categoryContent(self, tid, pg, filter=False, extend=None):
+        self._ready()
+        page = _int(pg)
+        try:
+            if not self._categories:
+                self._home()
+            category = self._categories.get(_text(tid))
+            if category is None:
+                category = next((c for c in self._categories.values() if _text(tid) in (_text(c.get('type_name')), _text(c.get('type_en')))), None)
+            if category is None:
+                raise _ApiError('未知分类')
+            options = extend if isinstance(extend, dict) else {}
+            sort = options.get('sort', 'hits')
+            params = {'type_name': category['type_name'], 'page': str(page), 'sort': sort if sort in ('hits', 'time', 'score', 'year') else 'hits'}
+            params.update({k: options[k] for k in ('class', 'area', 'year') if options.get(k)})
+            rows = self._request('filter/vod', params, ttl=30)
+            return self._page(rows, page, 24, 18)
+        except Exception as exc:
+            return dict(self._page([], page, 24, 18), msg=self._failure(exc))
+
+    def searchContent(self, key, quick=False, pg='1'):
+        self._ready()
+        page = _int(pg)
+        keyword = _text(key).strip()
+        if not keyword:
+            return self._page([], page, 15, 15)
+        try:
+            if self._search_mode == 'outer':
+                if page != 1:
+                    return self._page([], page, 15, 15)
+                rows = self._request('external_search/search', {'keyword': keyword}, ttl=30, timeout=25)
+                rows = rows if isinstance(rows, list) else []
+                items = [item for item in (self._item(row, True) for row in rows) if item]
+                return {'list': items, 'page': 1, 'pagecount': 1, 'limit': max(1, len(items)), 'total': len(items)}
+            rows = self._request('search/index', {'wd': keyword, 'page': page, 'limit': 15}, ttl=30)
+            return self._page(rows, page, 15, 15)
+        except Exception as exc:
+            return dict(self._page([], page, 15, 15), msg=self._failure(exc))
+
+    def _source(self, row, index=0):
+        if not isinstance(row, dict):
+            return None
+        code = _text(row.get('from')).strip()
+        if not code:
+            return None
+        episodes = {}
+        raw = row.get('episodes')
+        for offset, episode in enumerate(raw if isinstance(raw, list) else []):
+            if not isinstance(episode, dict):
+                continue
+            position = _int(episode.get('position'), offset+1)
+            episodes[position] = {'position': position, 'title': _text(episode.get('title')).strip() or '第%d集' % position, 'url': _text(episode.get('url')).strip()}
+        try:
+            order = float(row.get('sort', index))
+            if order != order or abs(order) == float('inf'):
+                order = index
+        except (ValueError, TypeError, OverflowError):
+            order = index
+        status = _text(row.get('decode_status')).strip()
+        return {'from': code, 'display_name': _text(row.get('display_name')).strip() or code, 'sort': order, 'decode_status': status if status in ('1', '2') else '0', 'episode_count': max(len(episodes), _int(row.get('episode_count'), 0)), 'episodes': episodes}
+
+    def _merge_catalog(self, state, patch):
+        if not isinstance(patch, dict) or not isinstance(patch.get('sources'), list):
+            raise _ApiError('播放目录数据结构错误')
+        revision = _text(patch.get('revision'))
+        old_revision = state.get('revision', '')
+        complete = patch.get('complete') is True
+        if old_revision and revision and old_revision != revision and not complete:
+            raise _ApiError('播放目录版本已更新，请重新打开详情')
+        old = state.get('sources', OrderedDict())
+        merged = OrderedDict() if complete else OrderedDict(old)
+        for index, row in enumerate(patch['sources']):
+            source = self._source(row, index)
+            if not source:
+                continue
+            code = source['from']
+            previous = merged.get(code)
+            if previous and not complete:
+                episodes = dict(previous['episodes'])
+                for pos, episode in source['episodes'].items():
+                    if not episode['url'] and pos in episodes:
+                        episode['url'] = episodes[pos]['url']
+                    episodes[pos] = episode
+                source['episodes'] = episodes
+                source['episode_count'] = max(source['episode_count'], previous['episode_count'], len(episodes))
+                for field in ('sort', 'display_name', 'decode_status'):
+                    if field not in row:
+                        source[field] = previous[field]
+            merged[code] = source
+        selected = patch.get('selected_source')
+        if isinstance(selected, dict):
+            code = _text(selected.get('from'))
+            source = merged.get(code)
+            if source:
+                full = self._source(selected)
+                if full:
+                    for pos, episode in full['episodes'].items():
+                        prior = source['episodes'].get(pos)
+                        if prior and not episode['url']:
+                            episode['url'] = prior['url']
+                        source['episodes'][pos] = episode
+        return {'revision': revision or old_revision, 'sources': merged, 'complete': complete}
+
+    def _native_catalog(self, identity):
+        data = self._request('vod/detail_v2', {'vod_id': identity}, ttl=40)
+        if not isinstance(data, dict) or not isinstance(data.get('detail'), dict):
+            raise _ApiError('详情数据结构错误')
+        detail = data['detail']
+        patch = data.get('playback')
+        state = self._merge_catalog({}, patch)
+        params = {'vod_id': identity, 'base_revision': state['revision']}
+        try:
+            playback = self._request('vod/playback_v2', params, ttl=20, timeout=20)
+            state = self._merge_catalog(state, playback)
+        except _ApiError as exc:
+            if not state['sources']:
+                raise
+            self._failure(exc)
+        return detail, state
+
+    def _aggregate(self, identity='', detail=None):
+        params = {}
+        if identity:
+            params['vod_id'] = identity
+        elif isinstance(detail, dict):
+            params = {'name': _text(detail.get('vod_name')), 'year': _text(detail.get('vod_year')), 'type': _text(detail.get('standard_category') or detail.get('vod_class')), 'douban_id': _text(detail.get('vod_douban_id'))}
+        if not params or not any(params.values()):
+            return []
+        data = self._request('internal/search_aggregate', params, ttl=45, timeout=25)
+        result = []
+        for index, row in enumerate(data if isinstance(data, list) else []):
+            if not isinstance(row, dict):
+                continue
+            play_froms = _text(row.get('vod_play_from')).split('$$$')
+            groups = _text(row.get('vod_play_url')).split('$$$')
+            for subindex, group in enumerate(groups):
+                play_from = play_froms[subindex] if subindex < len(play_froms) else ''
+                source_code = _text(row.get('site_key')).strip() or play_from.strip() or 'external_%d' % index
+                name = _text(row.get('site_name')).strip() or play_from.strip() or source_code
+                if len(groups) > 1:
+                    name += '·' + (play_from or str(subindex+1))
+                episodes = []
+                for position, part in enumerate(group.split('#'), 1):
+                    title, separator, value = part.partition('$')
+                    if not separator:
+                        continue
+                    value = value.strip()
+                    if value:
+                        episodes.append({'position': position, 'title': title.strip() or '第%d集' % position, 'url': value})
+                if not episodes:
+                    continue
+                source = self._source({'from': source_code, 'display_name': name, 'sort': row.get('sort', 1000+index), 'decode_status': row.get('decode_status'), 'episodes': episodes}, index)
+                source['external'] = True
+                source['external_params'] = params
+                source['row'] = index
+                source['subline'] = subindex
+                result.append(source)
+        return result
+
+    def _playlists(self, sources, identity, revision):
+        names, groups, used = [], [], {}
+        for source in sorted(sources, key=lambda s: s['sort']):
+            code = source['from']
+            episodes = dict(source['episodes'])
+            if not episodes and source['episode_count']:
+                episodes = {p: {'position': p, 'title': '第%d集' % p, 'url': ''} for p in range(1, min(source['episode_count'], 10000)+1)}
+            if not episodes:
+                continue
+            display = source['display_name'].replace('$', '＄').replace('#', '＃')
+            used[display] = used.get(display, 0) + 1
+            if used[display] > 1:
+                display += ' (%d)' % used[display]
+            entries = []
+            for position in sorted(episodes):
+                episode = episodes[position]
+                token = {'v': identity, 'r': revision, 's': code, 'p': position, 'u': episode['url'], 'd': source['decode_status']}
+                if source.get('external'):
+                    token.update(x=source['external_params'], i=source['row'], n=source['subline'])
+                title = episode['title'].replace('$', '＄').replace('#', '＃')
+                entries.append(title + '$' + _pack('xjkp:', token))
+            names.append(display)
+            groups.append('#'.join(entries))
+        return '$$$'.join(names), '$$$'.join(groups)
+
+    def detailContent(self, ids):
+        self._ready()
+        identity = _text(ids[0] if isinstance(ids, (list, tuple)) and ids else ids).strip()
+        try:
+            if identity.startswith('xjkx:'):
+                detail = _unpack('xjkx:', identity)
+                sources = self._aggregate(detail=detail)
+                revision = ''
+            else:
+                if not identity:
+                    raise _ApiError('影片标识为空')
+                detail, state = self._native_catalog(identity)
+                revision = state['revision']
+                sources = list(state['sources'].values())
+                if self._include_external:
+                    try:
+                        sources.extend(self._aggregate(identity))
+                    except _ApiError as exc:
+                        self._failure(exc)
+            item = self._item(detail, identity.startswith('xjkx:')) or {}
+            item['vod_id'] = identity
+            for key in ('vod_actor', 'vod_director', 'vod_class', 'vod_area', 'vod_year', 'type_name'):
+                item[key] = _text(detail.get(key))
+            item['vod_content'] = html.unescape(re.sub(r'<[^>]*>', '', _text(detail.get('vod_content'))))
+            item['vod_play_from'], item['vod_play_url'] = self._playlists(sources, identity, revision)
+            return {'list': [item]}
+        except Exception as exc:
+            return {'list': [], 'msg': self._failure(exc)}
+
+    def _episode_url(self, token):
+        value = _text(token.get('u')).strip()
+        if value:
+            return value, _text(token.get('d'))
+        code, position = _text(token.get('s')), _int(token.get('p'))
+        identity = _text(token.get('v'))
+        external = token.get('x')
+        if isinstance(external, dict):
+            if external.get('vod_id'):
+                sources = self._aggregate(_text(external['vod_id']))
+            else:
+                detail = {'vod_name': external.get('name'), 'vod_year': external.get('year'), 'standard_category': external.get('type'), 'vod_douban_id': external.get('douban_id')}
+                sources = self._aggregate(detail=detail)
+            candidates = [source for source in sources if source['from'] == code]
+            source = next((s for s in candidates if s.get('row') == token.get('i') and s.get('subline') == token.get('n')), candidates[0] if len(candidates) == 1 else None)
+        else:
+            params = {'vod_id': identity, 'from': code}
+            if token.get('r'):
+                params['base_revision'] = token['r']
+            data = self._request('vod/playback_v2', params, timeout=20)
+            if not isinstance(data, dict):
+                raise _ApiError('播放目录响应错误')
+            revision = _text(data.get('revision'))
+            if token.get('r') and revision and token['r'] != revision:
+                raise _ApiError('播放目录版本已更新，请重新打开详情')
+            source = next((self._source(row) for row in data.get('sources', []) if isinstance(row, dict) and _text(row.get('from')) == code), None)
+        episode = source['episodes'].get(position) if source else None
+        if not episode or not episode['url']:
+            raise _ApiError('该线路的本集地址暂不可用')
+        return episode['url'], source['decode_status']
+
+    def _media_type(self, value, headers):
+        path = urlsplit(value).path.lower()
+        if '.m3u8' in path or '/m3u8/' in path or path.endswith('/getm3u8'):
+            return 'm3u8'
+        if path.endswith('.mpd'):
+            return 'mpd'
+        if path.endswith(('.mp4', '.m4v', '.mov')):
+            return 'mp4'
+        if _MEDIA_RE.search(path):
+            return ''
+        try:
+            request_headers = dict(headers)
+            request_headers['Range'] = 'bytes=0-1023'
+            with build_opener().open(Request(value, headers=request_headers), timeout=6) as response:
+                content_type = response.headers.get('Content-Type', '').lower()
+                prefix = response.read(1024).lstrip(b'\xef\xbb\xbf \r\n\t')
+                if 'mpegurl' in content_type or prefix.startswith(b'#EXTM3U'):
+                    return 'm3u8'
+                if 'dash+xml' in content_type or b'<MPD' in prefix:
+                    return 'mpd'
+        except Exception:
+            pass
+        return ''
+
+    def playerContent(self, flag, id, vipFlags=None):
+        self._ready()
+        try:
+            identity = _text(id).strip()
+            if identity.startswith('xjkp:'):
+                token = _unpack('xjkp:', identity)
+                value, status = self._episode_url(token)
+                if status in ('1', '2'):
+                    cache_key = ('decode', _text(token.get('s')), value)
+                    resolved = self._get_cached(cache_key)
+                    if resolved is None:
+                        resolved = self._request('decode/url/', {'url': value, 'vodFrom': token.get('s'), '_t': int(time.time()*1000)}, timeout=15, success=1)
+                        if not isinstance(resolved, str) or not _http_url(resolved.strip()):
+                            raise _ApiError('解析接口未返回有效媒体地址')
+                        resolved = resolved.strip()
+                        self._put_cached(cache_key, resolved, 20)
+                    value = resolved
+            else:
+                value = identity
+            if not _http_url(value):
+                raise _ApiError('未取得有效媒体地址')
+            headers = {'User-Agent': _MOBILE_UA if urlsplit(value).path.lower().endswith('.mpd') else _UA}
+            media_type = self._media_type(value, headers)
+            if media_type == 'mpd':
+                headers['User-Agent'] = _MOBILE_UA
+            result = {'parse': 0, 'url': value, 'header': headers}
+            if media_type:
+                result['type'] = media_type
+            return result
+        except Exception as exc:
+            return {'parse': 0, 'url': '', 'header': {}, 'msg': self._failure(exc)}
+
+    def isVideoFormat(self, url):
+        return bool(_MEDIA_RE.search(_text(url)))
+
+    def manualVideoCheck(self):
+        return False
+
+    def localProxy(self, param):
+        return [404, 'text/plain; charset=utf-8', '']
+
+    def action(self, action):
+        self._ready()
+        if action == 'last_error':
+            return self._last_error
+        return ''
+
+    def destroy(self):
+        if hasattr(self, '_cache'):
+            with self._lock:
+                self._cache.clear()
+        return None
+
+
+
+
+import hmac
+from html.parser import HTMLParser
+from urllib.parse import quote, unquote, urljoin
+
+
+
+
+def _gmul(a, b):
+    value = 0
+    for _ in range(8):
+        if b & 1:
+            value ^= a
+        a = (a << 1) ^ (0x11b if a & 128 else 0)
+        b >>= 1
+    return value & 255
+
+
+def _sbox_value(value):
+    inverse, base, exponent = 1, value, 254
+    while exponent:
+        if exponent & 1:
+            inverse = _gmul(inverse, base)
+        base = _gmul(base, base)
+        exponent >>= 1
+    if value == 0:
+        inverse = 0
+    result = inverse ^ 0x63
+    for shift in (1, 2, 3, 4):
+        result ^= ((inverse << shift) | (inverse >> (8-shift))) & 255
+    return result
+
+
+_SBOX = tuple(_sbox_value(n) for n in range(256))
+_INV_SBOX = tuple(_SBOX.index(n) for n in range(256))
+
+
+class _AES:
+    def __init__(self, key):
+        if len(key) not in (16, 24, 32):
+            raise ValueError('Invalid AES key size')
+        self.rounds = len(key) // 4 + 6
+        words = [list(key[i:i+4]) for i in range(0, len(key), 4)]
+        nk, rcon = len(words), 1
+        for index in range(nk, 4*(self.rounds+1)):
+            word = words[-1][:]
+            if index % nk == 0:
+                word = [_SBOX[x] for x in word[1:] + word[:1]]
+                word[0] ^= rcon
+                rcon = _gmul(rcon, 2)
+            elif nk > 6 and index % nk == 4:
+                word = [_SBOX[x] for x in word]
+            words.append([a ^ b for a, b in zip(words[index-nk], word)])
+        self.keys = [sum(words[i:i+4], []) for i in range(0, len(words), 4)]
+
+    def encrypt(self, block):
+        if len(block) != 16:
+            raise ValueError('Invalid AES block')
+        state = [a ^ b for a, b in zip(block, self.keys[0])]
+        for number in range(1, self.rounds+1):
+            state = [_SBOX[state[((c+r) % 4)*4+r]] for c in range(4) for r in range(4)]
+            if number < self.rounds:
+                for start in range(0, 16, 4):
+                    a, b, c, d = state[start:start+4]
+                    state[start:start+4] = [_gmul(a, 2)^_gmul(b, 3)^c^d, a^_gmul(b, 2)^_gmul(c, 3)^d, a^b^_gmul(c, 2)^_gmul(d, 3), _gmul(a, 3)^b^c^_gmul(d, 2)]
+            state = [a ^ b for a, b in zip(state, self.keys[number])]
+        return bytes(state)
+
+    def decrypt(self, block):
+        if len(block) != 16:
+            raise ValueError('Invalid AES block')
+        state = [a ^ b for a, b in zip(block, self.keys[-1])]
+        for number in range(self.rounds-1, -1, -1):
+            state = [_INV_SBOX[state[((c-r) % 4)*4+r]] for c in range(4) for r in range(4)]
+            state = [a ^ b for a, b in zip(state, self.keys[number])]
+            if number:
+                for start in range(0, 16, 4):
+                    a, b, c, d = state[start:start+4]
+                    state[start:start+4] = [_gmul(a, 14)^_gmul(b, 11)^_gmul(c, 13)^_gmul(d, 9), _gmul(a, 9)^_gmul(b, 14)^_gmul(c, 11)^_gmul(d, 13), _gmul(a, 13)^_gmul(b, 9)^_gmul(c, 14)^_gmul(d, 11), _gmul(a, 11)^_gmul(b, 13)^_gmul(c, 9)^_gmul(d, 14)]
+        return bytes(state)
+
+
+def _unpad(data):
+    if not data or data[-1] < 1 or data[-1] > 16 or data[-data[-1]:] != bytes([data[-1]]) * data[-1]:
+        raise ValueError('Invalid AES padding')
+    return data[:-data[-1]]
+
+
+def _cbc_decrypt(key, iv, ciphertext):
+    if len(iv) != 16 or not ciphertext or len(ciphertext) % 16:
+        raise ValueError('Invalid CBC ciphertext')
+    aes, output = _AES(key), bytearray()
+    for start in range(0, len(ciphertext), 16):
+        block = ciphertext[start:start+16]
+        output.extend(a ^ b for a, b in zip(aes.decrypt(block), iv))
+        iv = block
+    return _unpad(bytes(output))
+
+
+def _gcm_multiply(x, y):
+    z = 0
+    for i in range(128):
+        if x & (1 << (127-i)):
+            z ^= y
+        y = (y >> 1) ^ (0xe1000000000000000000000000000000 if y & 1 else 0)
+    return z
+
+
+def _gcm_decrypt(key, nonce, ciphertext, tag, aad=b''):
+    if len(nonce) != 12 or len(tag) != 16:
+        raise ValueError('Invalid GCM parameters')
+    aes = _AES(key)
+    h = int.from_bytes(aes.encrypt(bytes(16)), 'big')
+    accumulator = 0
+    for data in (aad, ciphertext):
+        for start in range(0, len(data), 16):
+            block = data[start:start+16].ljust(16, b'\0')
+            accumulator = _gcm_multiply(accumulator ^ int.from_bytes(block, 'big'), h)
+    lengths = (len(aad)*8).to_bytes(8, 'big') + (len(ciphertext)*8).to_bytes(8, 'big')
+    accumulator = _gcm_multiply(accumulator ^ int.from_bytes(lengths, 'big'), h)
+    j0 = nonce + b'\0\0\0\1'
+    expected = bytes(a ^ b for a, b in zip(aes.encrypt(j0), accumulator.to_bytes(16, 'big')))
+    if not hmac.compare_digest(expected, tag):
+        raise ValueError('Invalid GCM authentication tag')
+    output = bytearray()
+    for index, start in enumerate(range(0, len(ciphertext), 16), 2):
+        stream = aes.encrypt(nonce + index.to_bytes(4, 'big'))
+        output.extend(a ^ b for a, b in zip(ciphertext[start:start+16], stream))
+    return bytes(output)
+
+
+
+
+_ED_Q = 2**255 - 19
+_ED_L = 2**252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_Q-2, _ED_Q) % _ED_Q
+_ED_I = pow(2, (_ED_Q-1)//4, _ED_Q)
+_ED_ZERO = (0, 1, 1, 0)
+
+
+def _ed_add(p, q):
+    a = (p[1]-p[0])*(q[1]-q[0]) % _ED_Q
+    b = (p[1]+p[0])*(q[1]+q[0]) % _ED_Q
+    c = 2*_ED_D*p[3]*q[3] % _ED_Q
+    d = 2*p[2]*q[2] % _ED_Q
+    e, f, g, h = b-a, d-c, d+c, b+a
+    return e*f % _ED_Q, g*h % _ED_Q, f*g % _ED_Q, e*h % _ED_Q
+
+
+def _ed_mul(p, scalar):
+    result = _ED_ZERO
+    while scalar:
+        if scalar & 1:
+            result = _ed_add(result, p)
+        p = _ed_add(p, p)
+        scalar >>= 1
+    return result
+
+
+def _ed_equal(p, q):
+    return (p[0]*q[2]-q[0]*p[2]) % _ED_Q == 0 and (p[1]*q[2]-q[1]*p[2]) % _ED_Q == 0
+
+
+def _ed_decode(raw):
+    if len(raw) != 32:
+        raise ValueError('Invalid Ed25519 point')
+    value = int.from_bytes(raw, 'little')
+    sign, y = value >> 255, value & (2**255-1)
+    if y >= _ED_Q:
+        raise ValueError('Noncanonical Ed25519 point')
+    yy = y*y % _ED_Q
+    xx = (yy-1)*pow(_ED_D*yy+1, _ED_Q-2, _ED_Q) % _ED_Q
+    x = pow(xx, (_ED_Q+3)//8, _ED_Q)
+    if x*x % _ED_Q != xx:
+        x = x*_ED_I % _ED_Q
+    if x*x % _ED_Q != xx or (x == 0 and sign):
+        raise ValueError('Invalid Ed25519 point')
+    if x & 1 != sign:
+        x = _ED_Q-x
+    return x, y, 1, x*y % _ED_Q
+
+
+def _ed_verify(key, signature, message):
+    if len(key) != 32 or len(signature) != 64:
+        raise ValueError('Invalid Ed25519 signature')
+    scalar = int.from_bytes(signature[32:], 'little')
+    if scalar >= _ED_L:
+        raise ValueError('Noncanonical Ed25519 signature')
+    a, r = _ed_decode(key), _ed_decode(signature[:32])
+    for point in (a, r):
+        if _ed_equal(_ed_mul(point, 8), _ED_ZERO) or not _ed_equal(_ed_mul(point, _ED_L), _ED_ZERO):
+            raise ValueError('Invalid Ed25519 subgroup')
+    challenge = int.from_bytes(hashlib.sha512(signature[:32]+key+message).digest(), 'little') % _ED_L
+    base = _ed_decode(bytes.fromhex('5866666666666666666666666666666666666666666666666666666666666666'))
+    if not _ed_equal(_ed_mul(base, scalar), _ed_add(r, _ed_mul(a, challenge))):
+        raise ValueError('Ed25519 signature mismatch')
+
+
+class _DocumentText(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts, self.hidden = [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script', 'style', 'template'):
+            self.hidden.append(tag)
+        elif not self.hidden and tag in ('p', 'div', 'pre', 'li', 'br'):
+            self.parts.append('\n')
+
+    def handle_endtag(self, tag):
+        if self.hidden and tag == self.hidden[-1]:
+            self.hidden.pop()
+        elif not self.hidden and tag in ('p', 'div', 'pre', 'li'):
+            self.parts.append('\n')
+
+    def handle_data(self, text):
+        if not self.hidden:
+            self.parts.append(text)
+
+
+def _b64url(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', value) or len(value)%4 == 1:
+        raise ValueError('Invalid Base64url')
+    raw = base64.urlsafe_b64decode(value + '='*(-len(value)%4))
+    if base64.urlsafe_b64encode(raw).decode().rstrip('=') != value:
+        raise ValueError('Noncanonical Base64url')
+    return raw
+
+
+def _endpoint_config(document):
+    if len(document.encode('utf-8')) > 524288:
+        raise ValueError('Endpoint document too large')
+    parser = _DocumentText()
+    parser.feed(document)
+    text = ''.join(parser.parts)
+    blocks = set(re.sub(r'\s', '', part) for part in re.findall(r'TVAPP_CONFIG_V1_BEGIN([\s\S]*?)TVAPP_CONFIG_V1_END', text))
+    if len(blocks) != 1:
+        raise ValueError('Endpoint configuration missing')
+    raw = _b64url(blocks.pop())
+    if len(raw) <= 95 or len(raw) > 65631 or raw[:3] != b'\x01\x01\x01':
+        raise ValueError('Unsupported endpoint configuration')
+    key = base64.b64decode('3EoMYcMw9X1igBsCb7CLCTKGTqWv9OpAAJr2xGa3co0=')
+    aad = b'TVAPP_ENDPOINT_CONFIG_V1:TVAPP:production:A256GCM\0'+raw[:3]
+    plain = _gcm_decrypt(key, raw[3:15], raw[15:-16], raw[-16:], aad)
+    signature, payload = plain[:64], plain[64:]
+    verify_key = base64.b64decode('Wouud32PFUGkngHhcYTwGNF55YE64oWBfoGeYmFpgmA=')
+    _ed_verify(verify_key, signature, b'TVAPP_ENDPOINT_CONFIG_V1:TVAPP:production:signature\0'+payload)
+    data = json.loads(payload)
+    if data.get('v') != 1 or set(data)-set('vraose') or type(data.get('r')) is not int or data['r'] < 1:
+        raise ValueError('Invalid endpoint payload')
+    apis = data.get('a')
+    if not isinstance(apis, list) or not 1 <= len(apis) <= 8:
+        raise ValueError('Invalid API list')
+    for url in apis:
+        if not isinstance(url, str) or len(url) > 2048:
+            raise ValueError('Invalid API endpoint')
+        parsed = urlsplit(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.fragment or parsed.query:
+            raise ValueError('Invalid API endpoint')
+    return {'revision': data['r'], 'apis': [url.rstrip('/') for url in apis]}
+
+
+def _decode_catalog(envelope):
+    if isinstance(envelope, dict) and envelope.get('schema_version') == 1 and isinstance(envelope.get('sites'), list) and type(envelope.get('revision')) is int:
+        return envelope
+    if not isinstance(envelope, dict) or envelope.get('format') != 'gzip-aesgcm-v1':
+        raise ValueError('Unsupported rule catalog')
+    if type(envelope.get('revision')) is not int or not 0 <= envelope['revision'] <= 2**53-1:
+        raise ValueError('Invalid catalog revision')
+    digest = envelope.get('sha256', '')
+    if not re.fullmatch(r'[a-f0-9]{64}', digest):
+        raise ValueError('Invalid catalog digest')
+    nonce = base64.b64decode(envelope['nonce'], validate=True)
+    payload = base64.b64decode(envelope['payload'], validate=True)
+    if len(nonce) != 12 or not 16 < len(payload) <= 8454144:
+        raise ValueError('Invalid rule envelope')
+    key = hashlib.sha256(b'TVAPP_RULE_CATALOG_V1\0'+_APP.encode()+b'\0'+_CLIENT_MATERIAL.encode()).digest()
+    aad = json.dumps([envelope['format'], envelope['revision'], digest], separators=(',', ':')).encode()
+    compressed = _gcm_decrypt(key, nonce, payload[:-16], payload[-16:], aad)
+    inflater = zlib.decompressobj(31)
+    raw = inflater.decompress(compressed, 8388609)
+    if len(raw) > 8388608 or inflater.unconsumed_tail or not inflater.eof or inflater.unused_data:
+        raise ValueError('Invalid compressed catalog')
+    if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), digest):
+        raise ValueError('Catalog digest mismatch')
+    result = json.loads(raw)
+    if result.get('revision') != envelope['revision'] or not isinstance(result.get('sites'), list):
+        raise ValueError('Invalid decoded rule catalog')
+    return result
+
+
+class _WebClient:
+    def __init__(self):
+        self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
+
+    def text(self, url, data=None, headers=None, limit=4194304, timeout=10):
+        if not _http_url(url):
+            raise ValueError('Invalid source URL')
+        request_headers = {'User-Agent': _UA, 'Accept-Encoding': 'gzip'}
+        request_headers.update(headers or {})
+        body = None
+        if data is not None:
+            if isinstance(data, dict):
+                body = json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+                request_headers.setdefault('Content-Type', 'application/json')
+            else:
+                body = data.encode('utf-8') if isinstance(data, str) else data
+        request = Request(url, data=body, headers=request_headers)
+        try:
+            response = self.opener.open(request, timeout=timeout)
+        except HTTPError as exc:
+            raise _ApiError('备用源 HTTP %d' % exc.code, status=exc.code)
+        with response:
+            raw = response.read(limit+1)
+            if len(raw) > limit:
+                raise ValueError('Source response too large')
+            if response.headers.get('Content-Encoding','').lower() == 'gzip':
+                inflater = zlib.decompressobj(31)
+                raw = inflater.decompress(raw, limit+1)
+                if len(raw) > limit or inflater.unconsumed_tail or not inflater.eof:
+                    raise ValueError('Source compressed response too large')
+            charset = response.headers.get_content_charset() or 'utf-8'
+        try:
+            return raw.decode(charset)
+        except (UnicodeError, LookupError):
+            return raw.decode('utf-8','replace')
+
+    def get_json(self, url, params=None, headers=None, timeout=10):
+        if params:
+            url += ('&' if '?' in url else '?') + urlencode(params)
+        return json.loads(self.text(url, headers=headers, timeout=timeout))
+
+    def post_json(self, url, data, headers=None, timeout=10):
+        return json.loads(self.text(url, data=data, headers=headers, timeout=timeout))
+
+
+class _HtmlNode:
+    def __init__(self, tag='', attrs=None, parent=None):
+        self.tag, self.attrs, self.parent = tag, dict(attrs or []), parent
+        self.children, self.parts = [], []
+
+    def text(self):
+        return ''.join(part.text() if isinstance(part, _HtmlNode) else part for part in self.parts)
+
+    def all(self, tag=None):
+        for child in self.children:
+            if tag is None or child.tag == tag:
+                yield child
+            yield from child.all(tag)
+
+    def classes(self):
+        return set(self.attrs.get('class', '').split())
+
+
+class _HtmlTree(HTMLParser):
+    def __init__(self, document):
+        super().__init__(convert_charrefs=True)
+        self.root = _HtmlNode()
+        self.current = self.root
+        self.feed(document)
+
+    def handle_starttag(self, tag, attrs):
+        node = _HtmlNode(tag, attrs, self.current)
+        self.current.children.append(node)
+        self.current.parts.append(node)
+        if tag not in ('area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'):
+            self.current = node
+
+    def handle_endtag(self, tag):
+        node = self.current
+        while node.parent is not None:
+            if node.tag == tag:
+                self.current = node.parent
+                return
+            node = node.parent
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_data(self, data):
+        self.current.parts.append(data)
+
+
+def _title_key(value):
+    return re.sub(r'[\s\u3000]+', '', html.unescape(_text(value))).casefold()
+
+
+def _website_sources(site, detail):
+    rule = site.get('rule') or {}
+    name, year = _text(detail.get('vod_name')), _text(detail.get('vod_year'))
+    base = site.get('base_url', '')
+    client = _WebClient()
+    if 'bttwo.' in base:
+        query = base.replace('{name}', quote(name, safe=''))
+        document = client.text(query)
+        tree = _HtmlTree(document).root
+        candidates = []
+        for node in tree.all('div'):
+            if not {'group', 'relative'} <= node.classes():
+                continue
+            image = next(node.all('img'), None)
+            anchor = next(node.all('a'), None)
+            if image is None or anchor is None or _title_key(image.attrs.get('alt')) != _title_key(name):
+                continue
+            text = node.text()
+            candidates.append((0 if year and year in text else 1, urljoin(query, anchor.attrs.get('href', ''))))
+        if not candidates:
+            return []
+        detail_url = sorted(candidates)[0][1]
+        document = client.text(detail_url)
+        tree = _HtmlTree(document).root
+        managers = [node for node in tree.all() if 'episodeManager(' in node.attrs.get('x-data', '')]
+        if not managers:
+            raise ValueError('备用蓝光-A 详情结构已改变')
+        manager = managers[0]
+        line_names = re.findall(r"lineName\s*:\s*['\"]([^'\"]+)['\"]", manager.attrs['x-data'])
+        lines = []
+        for offset, line in enumerate(site.get('lines', []), 1):
+            original = _text(line.get('original_name'))
+            if original not in line_names:
+                continue
+            line_number = str(line_names.index(original)+1)
+            episodes = []
+            for anchor in manager.all('a'):
+                if anchor.attrs.get('data-line') != line_number or not anchor.attrs.get('data-episode'):
+                    continue
+                href = anchor.attrs.get('href', '')
+                if href:
+                    episodes.append({'position': len(episodes)+1, 'title': anchor.attrs['data-episode'], 'url': urljoin(detail_url, href)})
+            if episodes:
+                lines.append({'source': site['site_key']+'_'+line['key'], 'name': line['name'], 'sort': line['sort'], 'episodes': episodes, 'managed': {'kind': 'website', 'site': 'bttwo', 'base': detail_url}})
+        return lines
+    if 'wdbay.' in base:
+        document = client.text(base, data='searchword='+quote(name,safe=''), headers={'Content-Type':'application/x-www-form-urlencoded'})
+        tree = _HtmlTree(document).root
+        links = []
+        for anchor in tree.all('a'):
+            href = anchor.attrs.get('href', '')
+            if '/view/' in href and _title_key(anchor.attrs.get('title') or anchor.text()) == _title_key(name):
+                links.append(urljoin(base,href))
+        if not links:
+            return []
+        detail_url = links[0]
+        document = client.text(detail_url)
+        tree = _HtmlTree(document).root
+        nav = [node for node in tree.all('ul') if {'nav','nav-tabs'} <= node.classes()]
+        tab_titles = []
+        for node in nav:
+            tab_titles.extend(anchor.text().strip() for anchor in node.all('a'))
+        selections = site.get('lines', [])
+        output = []
+        for line in selections:
+            original = _text(line.get('original_name'))
+            if original not in tab_titles:
+                continue
+            line_index = tab_titles.index(original)
+            episodes, seen = [], set()
+            for anchor in tree.all('a'):
+                href = anchor.attrs.get('href', '')
+                match = re.search(r'/play/[^/]+-(\d+)-(\d+)\.html', href)
+                if not match or int(match.group(1)) != line_index:
+                    continue
+                if href in seen or not anchor.text().strip():
+                    continue
+                seen.add(href)
+                episodes.append({'position': int(match.group(2))+1, 'title': anchor.attrs.get('title') or anchor.text().strip(), 'url': urljoin(detail_url, href)})
+            if episodes:
+                output.append({'source': site['site_key']+'_'+line['key'], 'name': line['name'], 'sort':line['sort'], 'episodes':episodes, 'managed':{'kind':'website','site':'qiyou','base':detail_url}})
+        return output
+    raise ValueError('未知托管网站规则')
+
+
+def _website_resolve(managed, url):
+    client = _WebClient()
+    headers = {'User-Agent':_UA}
+    current = url
+    for depth in range(4):
+        if _MEDIA_RE.search(urlsplit(current).path):
+            return {'parse':0, 'url':current, 'headers':headers}
+        document = client.text(current, headers=headers, timeout=12)
+        constants = dict(re.findall(r'''const\s+(Url|Sign|From)\s*=\s*["']([^"']*)["']''', document))
+        if {'Url', 'Sign', 'From'} <= set(constants) and "url: 'api.php'" in document:
+            data = client.get_json(urljoin(current, 'api.php'), {'url': constants['Url'], 'sign': constants['Sign'], 't': constants['From']}, headers={'User-Agent': _UA, 'Referer': current}, timeout=12)
+            if isinstance(data, dict) and data.get('code') == 200 and _http_url(data.get('url')):
+                return {'parse': 0, 'url': data['url'], 'headers': headers}
+            raise ValueError('奇优解析接口未返回媒体地址')
+        match = re.search(r'\bplayer_[A-Za-z0-9_]+\s*=\s*', document)
+        if match:
+            try:
+                player = json.JSONDecoder().raw_decode(document[match.end():].lstrip())[0]
+                value = _text(player.get('url'))
+                if str(player.get('encrypt')) == '1':
+                    value = unquote(value)
+                elif str(player.get('encrypt')) == '2':
+                    value = unquote(base64.b64decode(value).decode('utf-8'))
+                if _http_url(value) and _MEDIA_RE.search(urlsplit(value).path):
+                    return {'parse':0, 'url':value, 'headers':headers}
+            except (ValueError, UnicodeError):
+                pass
+        tree = _HtmlTree(document).root
+        media = next((node.attrs.get('src') for node in tree.all() if node.tag in ('video','source') and node.attrs.get('src')), '')
+        if media:
+            return {'parse':0,'url':urljoin(current,media),'headers':headers}
+        iframe = next((node.attrs.get('src') for node in tree.all('iframe') if node.attrs.get('src')), '')
+        if iframe:
+            current=urljoin(current,iframe)
+            continue
+        patterns = [r'''\b(?:url|videoUrl|playUrl)\s*[:=]\s*["'](https?[^"']+)["']''', r'''["'](https?[^"'\s<>]+\.m3u8(?:\?[^"'\s<>]*)?)["']''']
+        for pattern in patterns:
+            for found in re.findall(pattern, document):
+                value = html.unescape(found.replace('\\/','/'))
+                if _http_url(value) and _MEDIA_RE.search(value):
+                    return {'parse':0,'url':value,'headers':headers}
+        break
+    return {'parse':1,'url':url,'headers':headers}
+
+
+_DX_CRYPTO = 'http://103.36.222.35:9595/wexfnwshinidie/appv7/crypto.php'
+_DX_DEFAULT = {'key':'AppV7Dsx','host':'http://app2.dsx.ac/ndsx.php','home_url':'https://dsxys.com/','version':'4.0.0','version_number':'4000','pk_id':'com.qdsj.zxt.hzjc','build_time':'1786613938967','sign_md5':'56a4bb80bd67422e9c5b48f003d445c8','apk_length':'59954699','apk_path':'/data/app/~~mLGfF_Nezy4R4TqUevJVlg==/com.qdsj.zxt.hzjc-NlNuzFF6p4657CBJv-ue4Q==/base.apk','platform':'android','platform_version':'TP1A.220624.014','user_agent':'Dart/3.11 (dart:io)'}
+_DX_RUNTIME = None
+_DX_LOCK = threading.RLock()
+
+
+def _dx_json(value):
+    if isinstance(value, (dict,list)):
+        return value
+    try:
+        return json.loads(_text(value).lstrip('\ufeff').strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _dx_config():
+    global _DX_RUNTIME
+    with _DX_LOCK:
+        if _DX_RUNTIME is not None:
+            return _DX_RUNTIME
+        config = dict(_DX_DEFAULT)
+        client = _WebClient()
+        try:
+            response = client.get_json(_DX_CRYPTO, {'action':'config','key':config['key']}, timeout=8)
+            remote = response.get('data',response)
+            if isinstance(remote,dict):
+                config.update({key:value for key,value in remote.items() if value is not None})
+        except Exception:
+            pass
+        _DX_RUNTIME = config
+        return config
+
+
+def _dx_headers(config):
+    return {'User-Agent':_text(config.get('user_agent')),'version':_text(config.get('version')),'version-number':_text(config.get('version_number')),'Content-Type':'text/plain','pk-id':_text(config.get('pk_id')),'build-time':_text(config.get('build_time')),'platform':_text(config.get('platform')),'platform-version':_text(config.get('platform_version'))}
+
+
+def _dx_crypto(action, raw, config):
+    response = _WebClient().post_json(_DX_CRYPTO+'?action='+action, {'key':_text(config['key']),'raw':_text(raw)}, timeout=10)
+    if action == 'encrypt':
+        return response
+    if action == 'parse_decrypt':
+        parsed = _dx_json(response.get('text'))
+        if parsed is not None:
+            return parsed
+    if 'data' in response:
+        data = response['data']
+        parsed = _dx_json(data)
+        return parsed if parsed is not None else data
+    if 'text' in response:
+        data = response['text']
+        parsed = _dx_json(data)
+        return parsed if parsed is not None else data
+    return response
+
+
+def _dx_request(method, data, config):
+    raw = json.dumps({'method':method,'data':data,'csrf':int(time.time()*1000)},ensure_ascii=False,separators=(',',':'))
+    encrypted = _dx_crypto('encrypt',raw,config)
+    if isinstance(encrypted,str):
+        body = encrypted
+    elif isinstance(encrypted,dict):
+        body = encrypted.get('body') or encrypted.get('data')
+    else:
+        body = ''
+    if not isinstance(body,str) or not body:
+        raise ValueError('大师兄请求加密失败')
+    response = _WebClient().text(config['host'].rstrip('/')+'/v7/logs', data=body, headers=_dx_headers(config), timeout=12)
+    direct = _dx_json(response)
+    return direct if direct is not None else _dx_crypto('decrypt',response,config)
+
+
+def _dx_list(root):
+    if isinstance(root,list):
+        return root
+    if not isinstance(root,dict):
+        return []
+    if isinstance(root.get('data'),list):
+        return root['data']
+    if isinstance(root.get('data'),dict) and isinstance(root['data'].get('list'),list):
+        return root['data']['list']
+    return root.get('list') if isinstance(root.get('list'),list) else []
+
+
+def _dashi_sources(site, detail):
+    config = _dx_config()
+    name, year = _text(detail.get('vod_name')), _text(detail.get('vod_year'))
+    rows = _dx_list(_dx_request('search',{'token':'','pg':1,'text':name},config))
+    matched = [row for row in rows if isinstance(row,dict) and _title_key(row.get('vod_name') or row.get('name') or row.get('title')) == _title_key(name)]
+    if not matched:
+        return []
+    matched.sort(key=lambda row: 0 if year and year == _text(row.get('vod_year') or row.get('year')) else 1)
+    vid = matched[0].get('vod_id',matched[0].get('id'))
+    if vid is None or not _text(vid):
+        return []
+    if re.fullmatch(r'-?\d+',_text(vid)):
+        vid = int(vid)
+    root = _dx_request('video_detail',{'token':'','id':vid,'sign_md5':_text(config.get('sign_md5')),'apk_path':_text(config.get('apk_path')),'apk_length':int(config.get('apk_length') or 59954699)},config)
+    nested = root.get('data') if isinstance(root,dict) else None
+    if isinstance(nested,str):
+        nested = _dx_json(nested)
+    full = nested.get('vod_info') if isinstance(nested,dict) and nested.get('vod_info') else root.get('vod_info') if isinstance(root,dict) and root.get('vod_info') else nested if isinstance(nested,dict) else root
+    if not isinstance(full,dict):
+        raise ValueError('大师兄详情响应错误')
+    full = full.get('vod') or full.get('info') or full.get('video') or full
+    source_list = full.get('vod_url_with_player')
+    if isinstance(source_list,dict):
+        source_list = [dict(value,name=value.get('name') or key) if isinstance(value,dict) else {'name':key,'url':value} for key,value in source_list.items()]
+    if not isinstance(source_list,list):
+        source_list = []
+    if not source_list and full.get('vod_play_url'):
+        froms = _text(full.get('vod_play_from')).split('$$$')
+        source_list = [{'name':froms[index] if index<len(froms) else froms[0], 'code':froms[index] if index<len(froms) else froms[0], 'url':group} for index,group in enumerate(_text(full['vod_play_url']).split('$$$'))]
+    output = []
+    for selected in site.get('lines',[]):
+        original, flag = _text(selected.get('original_name')), _text(selected.get('flag'))
+        source = next((row for row in source_list if isinstance(row,dict) and ((flag and _text(row.get('code')) == flag) or _text(row.get('name')) == original)), None)
+        if source is None:
+            continue
+        code = _text(source.get('code') or source.get('name'))
+        episodes = []
+        for index, part in enumerate(_text(source.get('url') or source.get('urls') or source.get('vod_play_url')).split('#'),1):
+            title, separator, value = part.partition('$')
+            if not separator or not title.strip() or not value.strip():
+                continue
+            packet = {key:source.get(key,'') for key in ('parse_api','extra_parse_api','headers')}
+            packet.update(url=value,code=code,name=source.get('name'))
+            episodes.append({'position':index,'title':title.strip(),'url':_pack('dx:',packet)})
+        if episodes:
+            output.append({'source':site['site_key']+'_'+selected['key'],'name':selected['name'],'sort':selected['sort'],'episodes':episodes,'managed':{'kind':'dashi'},'headers':{'User-Agent':'dart'}})
+    return output
+
+
+def _dx_extract(value, depth=0):
+    if depth > 8:
+        return ''
+    if isinstance(value,str):
+        if _http_url(value.strip()):
+            return value.strip()
+        parsed = _dx_json(value)
+        return _dx_extract(parsed,depth+1) if parsed != value else ''
+    if isinstance(value,list):
+        for item in value:
+            found = _dx_extract(item,depth+1)
+            if found:
+                return found
+    if isinstance(value,dict):
+        for key in ('url','m3u8','play_url','playUrl','video_url','videoUrl','link','data','result','text'):
+            found = _dx_extract(value.get(key),depth+1)
+            if found:
+                return found
+    return ''
+
+
+def _dx_play_headers(packet):
+    headers = {'User-Agent':'dart'}
+    for part in _text(packet.get('headers')).split(','):
+        colon, equal = part.find(':'), part.find('=')
+        cut = colon if colon >= 0 else equal
+        if cut < 0:
+            continue
+        key, value = part[:cut].strip(), part[cut+1:].strip()
+        if key.lower() in ('user-agent','referer'):
+            headers['User-Agent' if key.lower()=='user-agent' else 'Referer'] = value
+    return headers
+
+
+def _dashi_resolve(value):
+    packet = _unpack('dx:',value)
+    config = _dx_config()
+    token = _text(packet.get('url'))
+    headers = _dx_play_headers(packet)
+    if _http_url(token) and not packet.get('parse_api') and not packet.get('extra_parse_api'):
+        return {'parse':0,'url':token,'headers':headers}
+    result = _dx_request('secret_parse_api_url',{'token':'','url':token,'player_code':_text(packet.get('code'))},config)
+    resolved = _dx_extract(result)
+    if resolved and resolved != token:
+        return {'parse':0,'url':resolved,'headers':headers}
+    used = set()
+    for parser in (packet.get('parse_api'),packet.get('extra_parse_api')):
+        if not parser or parser in used:
+            continue
+        used.add(parser)
+        for suffix in (token,quote(token,safe='')):
+            target = parser+suffix if 'url=' in parser else parser+('&url=' if '?' in parser else '?url=')+suffix
+            if not _http_url(target):
+                continue
+            try:
+                response = _WebClient().text(target,headers={'User-Agent':_text(config.get('user_agent'))},timeout=12)
+                resolved = _dx_extract(response)
+                if not resolved:
+                    resolved = _dx_extract(_dx_crypto('parse_decrypt',response,config))
+                if resolved:
+                    return {'parse':0,'url':resolved,'headers':headers}
+            except Exception:
+                continue
+    raise ValueError('大师兄解析未返回媒体地址')
+
+
+def _managed_site_sources(site, detail):
+    if site.get('kind') == 'website':
+        return _website_sources(site,detail)
+    if site.get('kind') == 'javascript' and 'AppV7Dsx' in _text((site.get('rule') or {}).get('规则')):
+        return _dashi_sources(site,detail)
+    return []
+
+
+def _managed_resolve(managed, value):
+    if managed.get('kind') == 'website':
+        return _website_resolve(managed,value)
+    if managed.get('kind') == 'dashi':
+        return _dashi_resolve(value)
+    raise ValueError('不支持的托管线路')
+
+
+class Spider(_CoreSpider):
+    def init(self, extend=''):
+        result = super().init(extend)
+        if isinstance(extend, str):
+            try:
+                extend = json.loads(extend) if extend.strip().startswith('{') else {}
+            except ValueError:
+                extend = {}
+        config = extend if isinstance(extend, dict) else {}
+        self._managed = config.get('managed', True) is not False
+        self._apis = [self._api]
+        if not config.get('api'):
+            self._apis.append('https://179.255.99.4:8090')
+        self._endpoint_revision = 2
+        self._endpoints_checked = 0
+        self._rule_issues = []
+        return result
+
+    def _refresh_endpoints(self):
+        now = time.monotonic()
+        if now < self._endpoints_checked:
+            return
+        self._endpoints_checked = now+3600
+        locations = ['https://anotepad.com/notes/wcqhmtf9', 'https://res.cloudinary.com/wygbngdd/raw/upload/1.txt', 'https://gitee.com/ahashare/sharetv/raw/master/README.md']
+        for location in locations:
+            try:
+                document = _WebClient().text(location, headers={'User-Agent': _UA}, limit=524288, timeout=6)
+                decoded = _endpoint_config(document)
+                if decoded['revision'] < self._endpoint_revision:
+                    continue
+                self._endpoint_revision = decoded['revision']
+                self._apis = decoded['apis']
+                return
+            except Exception:
+                continue
+
+    def _request(self, path, params=None, ttl=0, timeout=15, success=200):
+        self._ready()
+        try:
+            return super()._request(path, params, ttl, timeout, success)
+        except _ApiError as exc:
+            if exc.status or not exc.message.startswith('网络请求失败'):
+                raise
+            previous = self._api
+            alternatives = [api for api in self._apis if api != previous]
+            for api in alternatives[:1]:
+                self._api = api
+                try:
+                    return super()._request(path, params, ttl, timeout, success)
+                except _ApiError as error:
+                    if error.status or not error.message.startswith('网络请求失败'):
+                        raise
+                    exc = error
+            self._api = previous
+            self._refresh_endpoints()
+            raise exc
+
+    def _rule_catalog(self):
+        cached = self._get_cached(('managed_catalog',))
+        if cached is not None:
+            return cached
+        encrypted = self._request('rule-sources', ttl=300, timeout=15)
+        catalog = _decode_catalog(encrypted)
+        return self._put_cached(('managed_catalog',), catalog, 300)
+
+    def _managed_sources(self, detail):
+        sources, issues = [], []
+        catalog = self._rule_catalog()
+        for site in catalog.get('sites', []):
+            if not isinstance(site, dict):
+                continue
+            try:
+                rows = _managed_site_sources(site, detail)
+                for row in rows:
+                    episodes = row.get('episodes', [])
+                    source = self._source({'from': row['source'], 'display_name': row['name'], 'sort': row['sort'], 'decode_status': '0', 'episodes': episodes})
+                    if source and episodes:
+                        source['managed'] = row.get('managed')
+                        source['play_headers'] = row.get('headers') or {}
+                        sources.append(source)
+            except Exception as exc:
+                issues.append({'source': _text(site.get('name')), 'error': self._failure(exc)})
+        self._rule_issues = issues
+        return sources
+
+    def _playlists(self, sources, identity, revision):
+        names, groups = super()._playlists(sources, identity, revision)
+        if not names:
+            return names, groups
+        sorted_sources = [source for source in sorted(sources, key=lambda row: row['sort']) if source['episodes'] or source['episode_count']]
+        encoded_groups = groups.split('$$$')
+        for index, source in enumerate(sorted_sources):
+            if not source.get('managed'):
+                continue
+            updated = []
+            for entry in encoded_groups[index].split('#'):
+                title, _, encoded = entry.partition('$')
+                token = _unpack('xjkp:', encoded)
+                token['m'] = source['managed']
+                if source.get('play_headers'):
+                    token['h'] = source['play_headers']
+                updated.append(title+'$'+_pack('xjkp:', token))
+            encoded_groups[index] = '#'.join(updated)
+        return names, '$$$'.join(encoded_groups)
+
+    def detailContent(self, ids):
+        self._ready()
+        identity = _text(ids[0] if isinstance(ids, (list, tuple)) and ids else ids).strip()
+        try:
+            if identity.startswith('xjkx:'):
+                detail = _unpack('xjkx:', identity)
+                sources = self._aggregate(detail=detail)
+                revision = ''
+            else:
+                if not identity:
+                    raise _ApiError('影片标识为空')
+                detail, state = self._native_catalog(identity)
+                revision = state['revision']
+                sources = list(state['sources'].values())
+                if self._include_external:
+                    try:
+                        sources.extend(self._aggregate(identity))
+                    except _ApiError as exc:
+                        self._failure(exc)
+            if self._managed:
+                try:
+                    sources.extend(self._managed_sources(detail))
+                except Exception as exc:
+                    self._rule_issues = [{'source': '托管备用源', 'error': self._failure(exc)}]
+            item = self._item(detail, identity.startswith('xjkx:')) or {}
+            item['vod_id'] = identity
+            for key in ('vod_actor', 'vod_director', 'vod_class', 'vod_area', 'vod_year', 'type_name'):
+                item[key] = _text(detail.get(key))
+            item['vod_content'] = html.unescape(re.sub(r'<[^>]*>', '', _text(detail.get('vod_content'))))
+            item['vod_play_from'], item['vod_play_url'] = self._playlists(sources, identity, revision)
+            return {'list': [item]}
+        except Exception as exc:
+            return {'list': [], 'msg': self._failure(exc)}
+
+    def playerContent(self, flag, id, vipFlags=None):
+        self._ready()
+        identity = _text(id)
+        if not identity.startswith('xjkp:'):
+            return super().playerContent(flag, id, vipFlags)
+        try:
+            token = _unpack('xjkp:', identity)
+            managed = token.get('m')
+            if not isinstance(managed, dict):
+                return super().playerContent(flag, id, vipFlags)
+            value = token.get('u')
+            resolved = _managed_resolve(managed, value)
+            if not isinstance(resolved, dict) or not _http_url(resolved.get('url')):
+                raise _ApiError('备用源未取得有效媒体地址')
+            headers = resolved.get('headers') or token.get('h') or {'User-Agent': _UA}
+            headers = {key: _text(value) for key, value in headers.items() if key.lower() in ('user-agent', 'referer', 'origin', 'cookie') and '\r' not in _text(value) and '\n' not in _text(value)}
+            headers.setdefault('User-Agent', _UA)
+            kind = self._media_type(resolved['url'], headers)
+            result = {'parse': resolved.get('parse', 0), 'url': resolved['url'], 'header': headers}
+            if kind:
+                result['type'] = kind
+            return result
+        except Exception as exc:
+            return {'parse': 0, 'url': '', 'header': {}, 'msg': self._failure(exc)}
+
+    def action(self, value):
+        if value == 'source_status':
+            self._ready()
+            return json.dumps(self._rule_issues, ensure_ascii=False)
+        return super().action(value)
+
+
+
+_default = None
+
+
+_default_lock = threading.RLock()
+
+
+def _instance():
+    global _default
+    with _default_lock:
+        if _default is None:
+            _default = Spider()
+            _default.init()
+        return _default
+
+
+def init(extend=''):
+    return _instance().init(extend)
+
+
+def getName():
+    return _instance().getName()
+
+
+def getDependence():
+    return []
+
+
+def homeContent(filter=False):
+    return _instance().homeContent(filter)
+
+
+def homeVideoContent():
+    return _instance().homeVideoContent()
+
+
+def categoryContent(tid, pg, filter=False, extend=None):
+    return _instance().categoryContent(tid, pg, filter, extend)
+
+
+def detailContent(ids):
+    return _instance().detailContent(ids)
+
+
+def searchContent(key, quick=False, pg='1'):
+    return _instance().searchContent(key, quick, pg)
+
+
+def playerContent(flag, id, vipFlags=None):
+    return _instance().playerContent(flag, id, vipFlags)
+
+
+def isVideoFormat(url):
+    return bool(_MEDIA_RE.search(_text(url)))
+
+
+def manualVideoCheck():
+    return False
+
+
+def localProxy(param):
+    return _instance().localProxy(param)
+
+
+def action(value):
+    return _instance().action(value)
+
+
+def destroy():
+    return _instance().destroy()
